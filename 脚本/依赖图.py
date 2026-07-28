@@ -10,7 +10,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
 
-from 扫描 import SOURCE_EXTENSIONS, iter_files, read_text_limited
+from 扫描 import (
+    SOURCE_EXTENSIONS,
+    iter_files,
+    read_text_limited,
+    read_text_with_status,
+)
 
 
 JS_IMPORT = re.compile(
@@ -21,6 +26,8 @@ JS_IMPORT = re.compile(
 RUST_IMPORT = re.compile(r"^\s*use\s+((?:crate|self|super)::[A-Za-z0-9_:]+)", re.MULTILINE)
 GO_IMPORT = re.compile(r"(?:^|\n)\s*import\s+(?:\(\s*([\s\S]*?)\s*\)|(?:[A-Za-z_.]+\s+)?[\"']([^\"']+)[\"'])")
 GO_QUOTED = re.compile(r"[\"']([^\"']+)[\"']")
+SUPPORTED_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".rs", ".go"}
+Alias = Tuple[str, str, str]
 
 
 def _extract_imports(path: Path, content: str) -> Iterable[str]:
@@ -59,28 +66,139 @@ def _extract_imports(path: Path, content: str) -> Iterable[str]:
     return []
 
 
-def _load_ts_aliases(root: Path) -> List[Tuple[str, str]]:
-    path = root / "tsconfig.json"
+def _strip_jsonc(content: str) -> str:
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(content):
+        char = content[index]
+        next_char = content[index + 1] if index + 1 < len(content) else ""
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+        elif char == "/" and next_char == "/":
+            index += 2
+            while index < len(content) and content[index] not in "\r\n":
+                index += 1
+        elif char == "/" and next_char == "*":
+            index += 2
+            while index + 1 < len(content) and content[index:index + 2] != "*/":
+                index += 1
+            index += 2
+        else:
+            output.append(char)
+            index += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(output))
+
+
+def _load_jsonc(path: Path) -> Tuple[Dict[str, object], Optional[str]]:
     content = read_text_limited(path, 500_000)
     if not content:
-        return []
+        return {}, "empty_or_unreadable"
     try:
-        config = json.loads(content)
+        config = json.loads(_strip_jsonc(content))
     except (TypeError, ValueError):
+        return {}, "invalid_jsonc"
+    if not isinstance(config, dict):
+        return {}, "root_not_object"
+    return config, None
+
+
+def _tsconfig_chain(path: Path, root: Path, seen: Set[Path]) -> List[Path]:
+    path = path.resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
         return []
-    compiler = config.get("compilerOptions", {})
-    base_url = str(compiler.get("baseUrl", "."))
-    aliases = []
-    for alias, targets in compiler.get("paths", {}).items():
-        if not isinstance(targets, list):
+    if path in seen or not path.is_file():
+        return []
+    seen.add(path)
+    config, _ = _load_jsonc(path)
+    chain = []
+    parent = config.get("extends")
+    if isinstance(parent, str) and parent.startswith((".", "/")):
+        parent_path = (path.parent / parent).resolve()
+        json_candidate = Path(str(parent_path) + ".json")
+        if not parent_path.is_file() and json_candidate.is_file():
+            parent_path = json_candidate
+        chain.extend(_tsconfig_chain(parent_path, root, seen))
+    chain.append(path)
+    return chain
+
+
+def _load_ts_aliases(root: Path) -> Tuple[List[Alias], List[Dict[str, str]]]:
+    aliases: List[Alias] = []
+    errors: List[Dict[str, str]] = []
+    configs = sorted(
+        path for path in iter_files(root)
+        if path.name == "tsconfig.json" or (
+            path.name.startswith("tsconfig.") and path.suffix == ".json"
+        )
+    )
+    for entry in configs:
+        scope_path = entry.parent.relative_to(root).as_posix()
+        scope = "" if scope_path == "." else scope_path
+        entry_config, entry_error = _load_jsonc(entry)
+        if entry_error:
+            errors.append({
+                "file": entry.relative_to(root).as_posix(),
+                "reason": entry_error,
+            })
             continue
-        for target in targets:
-            aliases.append((alias, str(Path(base_url) / target)))
-    return aliases
+        elif isinstance(entry_config.get("extends"), str) and not str(
+            entry_config["extends"]
+        ).startswith((".", "/")):
+            errors.append({
+                "file": entry.relative_to(root).as_posix(),
+                "reason": "package_extends_unsupported",
+            })
+        for path in _tsconfig_chain(entry, root, set()):
+            config, error = _load_jsonc(path)
+            if error:
+                errors.append({
+                    "file": path.relative_to(root).as_posix()
+                    if path.is_relative_to(root) else str(path),
+                    "reason": error,
+                })
+                continue
+            compiler = config.get("compilerOptions", {})
+            if not isinstance(compiler, dict):
+                continue
+            base_url = str(compiler.get("baseUrl", "."))
+            paths = compiler.get("paths", {})
+            if not isinstance(paths, dict):
+                continue
+            for alias, targets in paths.items():
+                if not isinstance(targets, list):
+                    continue
+                for target in targets:
+                    resolved_target = path.parent / base_url / str(target)
+                    try:
+                        relative_target = resolved_target.resolve().relative_to(root)
+                    except ValueError:
+                        continue
+                    aliases.append((str(alias), relative_target.as_posix(), scope))
+    aliases.reverse()
+    aliases.sort(key=lambda item: len(Path(item[2]).parts), reverse=True)
+    return aliases, errors
 
 
-def _apply_alias(imported: str, aliases: List[Tuple[str, str]]) -> Optional[str]:
-    for alias, target in aliases:
+def _apply_alias(imported: str, source: str, aliases: List[Alias]) -> Optional[str]:
+    for alias, target, scope in aliases:
+        if scope and source != scope and not source.startswith(scope + "/"):
+            continue
         if "*" in alias:
             prefix, suffix = alias.split("*", 1)
             if imported.startswith(prefix) and imported.endswith(suffix):
@@ -94,7 +212,7 @@ def _apply_alias(imported: str, aliases: List[Tuple[str, str]]) -> Optional[str]
 def _candidates(
     source: str,
     imported: str,
-    aliases: List[Tuple[str, str]],
+    aliases: List[Alias],
     go_module: str,
 ) -> List[str]:
     source_path = Path(source)
@@ -112,7 +230,7 @@ def _candidates(
         module_path = Path(imported.replace(".", "/"))
         bases = [module_path, source_path.parent / module_path]
     elif source_path.suffix in {".js", ".jsx", ".ts", ".tsx"}:
-        aliased = _apply_alias(imported, aliases)
+        aliased = _apply_alias(imported, source, aliases)
         if aliased:
             bases = [Path(aliased)]
         elif imported.startswith(("@/", "~/")):
@@ -149,7 +267,7 @@ def _resolve(
     source: str,
     imported: str,
     nodes: Set[str],
-    aliases: List[Tuple[str, str]],
+    aliases: List[Alias],
     go_module: str,
 ) -> Optional[str]:
     for candidate in _candidates(source, imported, aliases, go_module):
@@ -159,14 +277,6 @@ def _resolve(
             continue
         if clean in nodes:
             return clean
-        if source.endswith(".go"):
-            package_files = sorted(
-                node for node in nodes
-                if node.startswith(clean.rstrip("/") + "/")
-                and node.endswith(".go") and not node.endswith("_test.go")
-            )
-            if package_files:
-                return package_files[0]
     return None
 
 
@@ -204,27 +314,39 @@ def build_graph(root: str) -> Dict[str, object]:
     if not project_root.exists() or not project_root.is_dir():
         return {"error": "路径不是有效目录：{}".format(project_root)}
 
-    files = [p for p in iter_files(project_root) if p.suffix in SOURCE_EXTENSIONS]
+    all_source_files = [p for p in iter_files(project_root) if p.suffix in SOURCE_EXTENSIONS]
+    files = [p for p in all_source_files if p.suffix in SUPPORTED_EXTENSIONS]
     nodes = {p.relative_to(project_root).as_posix() for p in files}
     raw_imports: Dict[str, Iterable[str]] = {}
+    skipped_files = []
     for path in files:
         rel = path.relative_to(project_root).as_posix()
-        try:
-            content = read_text_limited(path)
-        except OSError:
-            continue
-        if not content:
+        content, error = read_text_with_status(path)
+        if error:
+            skipped_files.append({"file": rel, "reason": error})
             continue
         raw_imports[rel] = _extract_imports(path, content)
 
-    aliases = _load_ts_aliases(project_root)
+    aliases, tsconfig_errors = _load_ts_aliases(project_root)
     go_mod = read_text_limited(project_root / "go.mod", 500_000)
     module_match = re.search(r"^\s*module\s+(\S+)", go_mod, re.MULTILINE)
     go_module = module_match.group(1) if module_match else ""
     edges: DefaultDict[str, Set[str]] = defaultdict(set)
+    package_edges: Set[Tuple[str, str]] = set()
+    go_packages = {
+        Path(node).parent.as_posix()
+        for node in nodes if node.endswith(".go")
+    }
     unresolved = 0
     for source, imports in raw_imports.items():
         for imported in imports:
+            if source.endswith(".go") and go_module and imported.startswith(go_module + "/"):
+                package_target = imported[len(go_module) + 1:]
+                if package_target in go_packages:
+                    package_edges.add((source, package_target))
+                else:
+                    unresolved += 1
+                continue
             target = _resolve(source, imported, nodes, aliases, go_module)
             if target and target != source:
                 edges[source].add(target)
@@ -236,12 +358,22 @@ def build_graph(root: str) -> Dict[str, object]:
         for target in targets:
             incoming[target] += 1
     return {
+        "schema_version": "2.0",
         "total_files_analyzed": len(nodes),
+        "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
+        "unsupported_source_files": [
+            path.relative_to(project_root).as_posix()
+            for path in all_source_files if path.suffix not in SUPPORTED_EXTENSIONS
+        ],
         "total_import_edges": sum(map(len, edges.values())),
         "unresolved_local_imports": unresolved,
         "edges": [
             {"source": source, "target": target}
             for source in sorted(edges) for target in sorted(edges[source])
+        ],
+        "package_edges": [
+            {"source": source, "target_package": target}
+            for source, target in sorted(package_edges)
         ],
         "most_imported_modules": [
             {"module": node, "imported_by_count": count}
@@ -256,6 +388,10 @@ def build_graph(root: str) -> Dict[str, object]:
             for node, targets in sorted(edges.items(), key=lambda item: (-len(item[1]), item[0]))
         ][:20],
         "cycles": _cycles(edges),
+        "diagnostics": {
+            "skipped_files": skipped_files,
+            "tsconfig_errors": tsconfig_errors,
+        },
     }
 
 

@@ -23,6 +23,13 @@ cp -r 新人上手向导 /你的项目/.opencode/skills/
 
 然后重启 opencode。
 
+也可以直接从 GitHub 安装：
+
+```bash
+git clone https://github.com/Nafixcn/-Onboarding-skill.git \
+  /你的项目/.opencode/skills/onboarding-guide
+```
+
 ## 使用方法
 
 在 opencode 中输入：
@@ -64,9 +71,22 @@ python3 脚本/追踪流程.py /path/to/project "搜索词" --depth 5
 python3 -m unittest discover -s tests -v
 ```
 
-扫描器会识别常见框架、嵌套入口、构建与 CI 配置，并遵守常见忽略目录及
-`.gitignore`。依赖图输出实际项目内边、未解析导入和循环依赖。流程追踪基于
-静态符号调用；反射、动态导入和运行时注册的调用需要人工复核。
+扫描器会识别常见框架、嵌套入口、构建与 CI 配置。在 Git 仓库中，它通过
+Git 获取受版本控制和未忽略的文件；非 Git 项目使用内置 `.gitignore` 降级解析。
+输出包含文件枚举来源、跳过文件和解析错误，便于判断报告完整性。
+
+依赖图对 Python、JavaScript/TypeScript、Go 和 Rust 提供静态解析：
+
+- Python、JavaScript/TypeScript、Rust 输出文件级依赖。
+- Go 输出包级依赖，避免伪造任意文件目标。
+- TypeScript 支持 JSONC、相对 `extends` 和包内路径别名。
+- 其他源码语言会列入 `unsupported_source_files`，不会伪装成已分析。
+
+扫描器和依赖图 JSON 均包含 `schema_version: "2.0"`。相较早期输出，Go
+依赖已从不准确的文件边迁移到 `package_edges`。
+
+流程追踪会结合文件依赖消歧同名符号，并标记 `high` 或 `heuristic` 置信度。
+反射、动态导入、依赖注入和运行时注册仍需要人工复核。
 
 ## 输出
 

@@ -4,10 +4,11 @@
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 TECH_MANIFESTS = {
@@ -104,9 +105,54 @@ def _ignored(rel: Path, patterns: Iterable[Tuple[str, bool]]) -> bool:
     return ignored
 
 
-def iter_files(root: Path) -> Iterable[Path]:
+def _git_files(root: Path) -> Optional[List[Path]]:
+    if not (root / ".git").exists():
+        return None
+    safe_git = [
+        "git", "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.untrackedCache=false",
+        "-C", str(root),
+    ]
+    try:
+        top_level = subprocess.run(
+            safe_git + ["rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=True,
+            timeout=10,
+            text=True,
+        ).stdout.strip()
+        if Path(top_level).resolve() != root:
+            return None
+        process = subprocess.run(
+            safe_git + [
+                "ls-files", "--cached", "--others", "--exclude-standard", "-z"
+            ],
+            capture_output=True,
+            check=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    paths = []
+    for raw in process.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = Path(raw.decode("utf-8", errors="surrogateescape"))
+        path = root / rel
+        try:
+            path.resolve().relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if path.is_file() and not path.is_symlink():
+            paths.append(path)
+    return sorted(paths)
+
+
+def _walk_files(root: Path) -> List[Path]:
     root = root.resolve()
     patterns = _gitignore_patterns(root)
+    result = []
     for current, dirs, files in os.walk(str(root), followlinks=False):
         current_path = Path(current)
         kept = []
@@ -128,17 +174,46 @@ def iter_files(root: Path) -> Iterable[Path]:
             except (OSError, ValueError):
                 continue
             if path.is_file():
-                yield path
+                result.append(path)
+    return result
+
+
+def project_files(root: Path) -> Tuple[List[Path], str]:
+    """返回可分析文件以及枚举来源：git 或 fallback。"""
+    root = root.resolve()
+    git_files = _git_files(root)
+    if git_files is not None:
+        return git_files, "git"
+    return _walk_files(root), "fallback"
+
+
+def iter_files(root: Path) -> Iterable[Path]:
+    files, _ = project_files(root)
+    return iter(files)
+
+
+def read_text_with_status(
+    path: Path, limit: int = MAX_SOURCE_BYTES
+) -> Tuple[str, Optional[str]]:
+    try:
+        if path.is_symlink():
+            return "", "symlink"
+        if not path.is_file():
+            return "", "not_file"
+        size = path.stat().st_size
+        if size > limit:
+            return "", "size_limit:{}>{}".format(size, limit)
+        return path.read_text(encoding="utf-8", errors="strict"), None
+    except UnicodeDecodeError:
+        return "", "decode_error"
+    except OSError as error:
+        return "", "read_error:{}".format(type(error).__name__)
 
 
 def read_text_limited(path: Path, limit: int = MAX_SOURCE_BYTES) -> str:
     """读取有大小上限的普通文件；超限、链接或错误均返回空字符串。"""
-    try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > limit:
-            return ""
-        return path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return ""
+    content, _ = read_text_with_status(path, limit)
+    return content
 
 
 def _read_manifest(path: Path) -> str:
@@ -165,12 +240,50 @@ def _detect_frameworks(path: Path, content: str) -> Set[str]:
     return {FRAMEWORK_PATTERNS[token] for token in tokens if token in FRAMEWORK_PATTERNS}
 
 
+def _package_metadata(path: Path, content: str) -> Dict[str, object]:
+    if path.name != "package.json":
+        return {}
+    try:
+        manifest = json.loads(content)
+    except (TypeError, ValueError):
+        return {}
+    result: Dict[str, object] = {}
+    for key in ("name", "version", "private"):
+        if key in manifest:
+            result[key] = manifest[key]
+    scripts = manifest.get("scripts")
+    if isinstance(scripts, dict):
+        result["scripts"] = dict(sorted(scripts.items()))
+    return result
+
+
+def _is_monorepo(root: Path) -> bool:
+    if (root / "pnpm-workspace.yaml").is_file() or (root / "go.work").is_file():
+        return True
+    package_content = _read_manifest(root / "package.json")
+    if package_content:
+        try:
+            package = json.loads(package_content)
+            if package.get("workspaces"):
+                return True
+        except (TypeError, ValueError):
+            pass
+    cargo_content = _read_manifest(root / "Cargo.toml")
+    if re.search(r"(?m)^\s*\[workspace\]\s*$", cargo_content):
+        return True
+    return False
+
+
 def scan_project(root: str) -> Dict[str, object]:
     project_root = Path(root).expanduser().resolve()
     result: Dict[str, object] = {
+        "schema_version": "2.0",
         "project_name": project_root.name, "project_path": str(project_root),
         "tech_stack": [], "frameworks": [], "entry_points": [],
         "build_and_ci": [], "directory_map": [], "file_stats": {},
+        "manifest_details": [], "diagnostics": {
+            "file_enumeration": "", "skipped_files": [],
+        },
     }
     if not project_root.exists():
         result["error"] = "路径不存在：{}".format(project_root)
@@ -179,21 +292,36 @@ def scan_project(root: str) -> Dict[str, object]:
         result["error"] = "路径不是目录：{}".format(project_root)
         return result
 
-    top_dirs = sorted(p.name for p in project_root.iterdir()
-                      if p.is_dir() and p.name not in DEFAULT_IGNORES and not p.name.startswith("."))
+    files, enumeration = project_files(project_root)
+    result["diagnostics"]["file_enumeration"] = enumeration
+    top_dirs = {
+        path.relative_to(project_root).parts[0]
+        for path in files if len(path.relative_to(project_root).parts) > 1
+        and not path.relative_to(project_root).parts[0].startswith(".")
+    }
     manifests = []
     framework_names: Set[str] = set()
     file_counts = defaultdict(int)
     entries: Set[str] = set()
     configs: Set[str] = set()
 
-    for path in iter_files(project_root):
+    for path in files:
         rel = path.relative_to(project_root)
         file_counts[path.suffix.lower()] += 1
         if path.name in TECH_MANIFESTS and len(rel.parts) <= 4:
             manifests.append({"file": rel.as_posix(), "label": TECH_MANIFESTS[path.name]})
-            content = _read_manifest(path)
-            framework_names.update(_detect_frameworks(path, content))
+            content, error = read_text_with_status(path, 500_000)
+            if error:
+                result["diagnostics"]["skipped_files"].append({
+                    "file": rel.as_posix(), "reason": error,
+                })
+            else:
+                framework_names.update(_detect_frameworks(path, content))
+                metadata = _package_metadata(path, content)
+                if metadata:
+                    result["manifest_details"].append({
+                        "file": rel.as_posix(), **metadata,
+                    })
         if path.name in ENTRY_POINT_NAMES and len(rel.parts) <= 4:
             entries.add(rel.as_posix())
         if path.name in CONFIG_NAMES or rel.as_posix().startswith(".github/workflows/"):
@@ -206,13 +334,11 @@ def scan_project(root: str) -> Dict[str, object]:
     result["entry_points"] = sorted(entries)
     result["build_and_ci"] = sorted(configs)
     result["directory_map"] = [
-        {"path": name, "description": COMMON_DIRS.get(name.lower(), "")} for name in top_dirs
+        {"path": name, "description": COMMON_DIRS.get(name.lower(), "")}
+        for name in sorted(top_dirs)
     ]
     result["file_stats"] = dict(sorted(file_counts.items(), key=lambda item: item[1], reverse=True)[:15])
-    result["is_monorepo"] = (
-        any(name in top_dirs for name in ("packages", "apps"))
-        or any("/" in item["file"] for item in manifests)
-    )
+    result["is_monorepo"] = _is_monorepo(project_root)
     return result
 
 

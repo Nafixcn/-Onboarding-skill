@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import DefaultDict, Dict, Iterable, List, Set, Tuple
 
+from 依赖图 import build_graph
 from 扫描 import SOURCE_EXTENSIONS, iter_files, read_text_limited
 
 
@@ -53,6 +54,11 @@ def _python_symbols(path: Path, rel: str, content: str) -> List[Dict[str, object
             return
 
     symbols = []
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
@@ -61,9 +67,17 @@ def _python_symbols(path: Path, rel: str, content: str) -> List[Dict[str, object
             for statement in node.body:
                 visitor.visit(statement)
         line = content.splitlines()[node.lineno - 1].strip()
+        qualifiers = [node.name]
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                qualifiers.append(parent.name)
+            parent = parents.get(parent)
         symbols.append({
             "name": node.name, "file": rel, "line": node.lineno,
+            "qualname": ".".join(reversed(qualifiers)),
             "content": line, "calls": sorted(set(visitor.calls) - {node.name}),
+            "confidence": "high",
         })
     return symbols
 
@@ -98,7 +112,9 @@ def _generic_symbols(rel: str, content: str) -> List[Dict[str, object]]:
         }
         symbols.append({
             "name": name, "file": rel, "line": index + 1,
+            "qualname": name,
             "content": line.strip(), "calls": sorted(calls),
+            "confidence": "heuristic",
         })
     return symbols
 
@@ -152,57 +168,97 @@ def find_references(project_root: Path, search_term: str) -> List[Dict[str, obje
     return results[:100]
 
 
+def _symbol_key(symbol: Dict[str, object]) -> Tuple[str, str, int]:
+    return (
+        str(symbol["file"]),
+        str(symbol["qualname"]),
+        int(symbol["line"]),
+    )
+
+
+def _resolve_call(
+    name: str,
+    caller_file: str,
+    index: DefaultDict[str, List[Dict[str, object]]],
+    dependency_targets: Dict[str, Set[str]],
+) -> List[Dict[str, object]]:
+    definitions = index.get(name, [])
+    same_file = [item for item in definitions if item["file"] == caller_file]
+    if same_file:
+        return same_file
+    imported_files = dependency_targets.get(caller_file, set())
+    imported = [item for item in definitions if item["file"] in imported_files]
+    if imported:
+        return imported
+    return definitions if len(definitions) == 1 else []
+
+
 def trace_flow(project_root: Path, entry_point: str, max_depth: int = 5) -> str:
     project_root = project_root.resolve()
     index, _ = build_symbol_index(project_root)
+    graph = build_graph(str(project_root))
     output = ["## 流程追踪：`{}`".format(entry_point), ""]
-    queue = deque([(entry_point, 0, None)])
-    expanded: Set[str] = set()
+    unsupported = graph.get("unsupported_source_files", [])
+    skipped = graph.get("diagnostics", {}).get("skipped_files", [])
+    if unsupported:
+        output.extend([
+            "> 覆盖提示：{} 个源码文件属于未支持语言。".format(len(unsupported)),
+            "",
+        ])
+    if skipped:
+        output.extend([
+            "> 覆盖提示：{} 个源码文件因读取限制被跳过。".format(len(skipped)),
+            "",
+        ])
+    dependency_targets: DefaultDict[str, Set[str]] = defaultdict(set)
+    for edge in graph.get("edges", []):
+        dependency_targets[str(edge["source"])].add(str(edge["target"]))
+
+    entry_definitions = index.get(entry_point, [])
+    if not entry_definitions:
+        refs = find_references(project_root, entry_point)
+        if refs:
+            for ref in refs[:5]:
+                output.extend([
+                    "▶ `{}:{}` — {}".format(
+                        ref["file"], ref["line"], str(ref["content"])[:120]
+                    ), ""
+                ])
+        else:
+            output.extend(["▶ （未找到匹配 `{}`）".format(entry_point), ""])
+        return "\n".join(output)
+
+    queue = deque((symbol, 0, None) for symbol in entry_definitions[:5])
+    expanded: Set[Tuple[str, str, int]] = set()
     emitted: Set[Tuple[str, str, int]] = set()
 
     while queue:
-        term, depth, caller = queue.popleft()
+        symbol, depth, caller = queue.popleft()
         if depth > max_depth:
             continue
-        definitions = index.get(term, [])
         indent = "  " * depth
         arrow = "▶" if depth == 0 else "→"
-        if not definitions:
-            if depth == 0:
-                refs = find_references(project_root, term)
-                if refs:
-                    for ref in refs[:5]:
-                        output.extend([
-                            "{}{} `{}:{}` — {}".format(
-                                indent, arrow, ref["file"], ref["line"], str(ref["content"])[:120]
-                            ), ""
-                        ])
-                else:
-                    output.extend(["{}{} （未找到匹配 `{}`）".format(indent, arrow, term), ""])
-            continue
-
-        for definition in definitions[:5]:
-            key = (term, str(definition["file"]), int(definition["line"]))
-            if key in emitted:
-                continue
+        key = _symbol_key(symbol)
+        if key not in emitted:
             emitted.add(key)
             relation = "（由 `{}` 调用）".format(caller) if caller else ""
             output.extend([
-                "{}{} `{}:{}` — {} {}".format(
-                    indent, arrow, definition["file"], definition["line"],
-                    str(definition["content"])[:120], relation
+                "{}{} `{}:{}` `{}` [{}] — {} {}".format(
+                    indent, arrow, symbol["file"], symbol["line"],
+                    symbol["qualname"], symbol["confidence"],
+                    str(symbol["content"])[:120], relation
                 ).rstrip(),
                 "",
             ])
-        if term in expanded or depth == max_depth:
+        if key in expanded or depth == max_depth:
             continue
-        expanded.add(term)
-        calls: Set[str] = set()
-        for definition in definitions:
-            calls.update(str(call) for call in definition["calls"])
-        for call in sorted(calls):
-            if call in index:
-                queue.append((call, depth + 1, term))
+        expanded.add(key)
+        for call in symbol["calls"]:
+            targets = _resolve_call(
+                str(call), str(symbol["file"]), index, dependency_targets
+            )
+            for target in targets[:5]:
+                queue.append((target, depth + 1, str(symbol["qualname"])))
 
     return "\n".join(output)
 
